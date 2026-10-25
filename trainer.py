@@ -1,20 +1,83 @@
 """Rolling-window XGBoost trainer for the sherlock quantitative research study.
 
-See trainer.md for the dataset layout and the rolling-fit procedure.
+Intraday edition (2026-09-19): samples are keyed by (ukey, time) — the
+prediction instants of one eif task (targets.py; task 0 盘前 = 09:24:59,
+task 1 盘中 = the 48 five-minute points) — with targets from
+target.{task}/, the daily (ukey, weight, group) file weight/ broadcast
+to each instant (eif_v11; the per-instant intraday weight is retired),
+and features through the xloader_contract (an x_loader(date) ->
+polars frame of [ukey, time, *features]). I/O is polars; the numeric
+core is numpy + xgboost. See .claude/skills/evaluate-factors/SKILL.md
+for the dataset layout and the rolling-fit procedure.
 """
 
 import datetime
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import xgboost as xgb
 
 # Trading calendar (YYYYMMDD per row), generated from the weight-folder
 # listing.
-CALENDAR_FILE = "/data/efs/CN-EQ/calendar.csv"
-DATES = pd.read_csv(CALENDAR_FILE, dtype=str)["date"]
+CALENDAR_FILE = "/data/CN-EQ/calendar.csv"
+DATES = pl.read_csv(CALENDAR_FILE, schema_overrides={"date": pl.String})["date"]
 POS = {d: i for i, d in enumerate(DATES)}
+
+ID_COLS = ("ukey", "time")
+
+
+def group_dir(groups: list[int]) -> str:
+    """Name of the model work dir (before the _{strategy} suffix) of the
+    model trained over the groups: their labels concatenated, e.g.
+    group0123."""
+    return "group" + "".join(map(str, groups))
+
+
+# Task 1 without --times trains two models per group set: `open` on the
+# 09:30 instant and `rest` on the other instants, each predicting its own
+# instants of the full grid. OPEN_SEC is 09:30 as seconds of the
+# Asia/Shanghai day (targets.TASK_SECONDS).
+OPEN_SEC = 9 * 3600 + 30 * 60
+TIME_SLICES = ("open", "rest")
+
+
+def time_slices(task: int, train_secs: list[int], full_secs: list[int],
+                split: bool = True) -> list[tuple[str, list[int], list[int]]]:
+    """The models of a task over its instants, as (name, training instants,
+    prediction instants): with `split` (the CLI: task 1 without --times),
+    for task 1 with 09:30 and at least one other instant among the
+    training instants, `open` (09:30 only) and `rest` (the others,
+    predicting every other instant of the full grid); else one unnamed
+    model over all the training instants predicting the full grid."""
+    rest = [s for s in train_secs if s != OPEN_SEC]
+    if split and task == 1 and OPEN_SEC in train_secs and rest:
+        return [("open", [OPEN_SEC], [OPEN_SEC]),
+                ("rest", rest, [s for s in full_secs if s != OPEN_SEC])]
+    return [("", list(train_secs), list(full_secs))]
+
+
+def model_dirs(work_root: str, groups: list[int], strategy: str) -> list[str]:
+    """The model work dirs (names under work_root) a study has: with gd =
+    group_dir(groups), either `{gd}_{strategy}` (one model over the task's
+    instants) or its time slices `{gd}_open_{strategy}` + `{gd}_rest_{strategy}`
+    (time_slices). Their pred files partition the prediction universe."""
+    gd = group_dir(groups)
+    found = [d for d in [f"{gd}_{strategy}"] + [f"{gd}_{t}_{strategy}" for t in TIME_SLICES]
+             if os.path.isdir(f"{work_root}/{d}")]
+    assert found, f"no model dir {gd}[_open|_rest]_{strategy} under {work_root}"
+    return found
+
+
+def slice_secs(dir_name: str, strategy: str, full_secs: list[int]) -> list[int]:
+    """The prediction instants of a model dir named by model_dirs."""
+    tag = dir_name.removesuffix(f"_{strategy}").rsplit("_", 1)[-1]
+    if tag == "open":
+        return [OPEN_SEC]
+    if tag == "rest":
+        return [s for s in full_secs if s != OPEN_SEC]
+    return list(full_secs)
 
 
 def _end_month() -> str:
@@ -36,22 +99,65 @@ def _end_month() -> str:
 class Trainer:
     """Rolling-window XGBoost trainer.
 
-    Users configure work_dir, the w/y/x loaders and the execution strategy;
-    W and Y must each yield a single value column besides ukey. The
+    Users configure work_dir, the w/y/x loaders and the execution strategy.
+    Each loader maps a date "YYYYMMDD" to a polars frame keyed by
+    (ukey Int32, time Datetime[ns, UTC]): W with a single `weight` column,
+    Y with a single target column, X with one column per feature. The
     rolling-fit configuration and model hyper-parameters are class variables
     maintained by the Trainer admin team. run() writes model checkpoints to
-    {work_dir}/ckpt/ and monthly predictions to {work_dir}/pred/.
+    {work_dir}/ckpt/ and per-day predictions to {work_dir}/pred/.
+
+    Training and prediction may run on different instants: the w/x loaders
+    define the TRAINING samples (e.g. a --times subset of the task grid),
+    pred_w_loader / pred_x_loader the PREDICTION rows (default: the same).
+    Predictions cover every finite-weight row of pred_w_loader whether or
+    not it has a target, so the evaluator always sees the full grid
+    (decided 2026-10-06: however many instants train the model, predict all
+    of the task's instants).
 
     The execution strategy sets the training objective. A long_short book
     deploys the prediction as-is, so it trains with plain squarederror. A
     one-sided book deploys the clipped prediction — ReLU(pred) for
     long_only, -ReLU(-pred) for short_only — so it trains against the
     clipped value instead: (y - ReLU(pred))^2 resp. (y + ReLU(-pred))^2;
-    see _one_sided_obj.
+    see _clipped_obj.
+
+    Group dummies: with `group_dummies` set to a list of group labels, W
+    also carries the `group` column and the trainer appends one-hot
+    features group_{g} (1.0 on the sample's group, else 0.0) after the
+    x_loader's features, so one booster trains and predicts over all of
+    those groups and can still split on the label; the CLI always trains
+    this way (one model over its --group values). Without it W must not
+    carry `group` (a Trainer over one universe with no label).
+
+    Limit-locked samples: W may carry a `lock` column (+1 mark on 涨停,
+    -1 on 跌停, 0 free, null no mark), consumed per `lock_mask`, the
+    trainer's counterpart of the Evaluator's option of the same name:
+    "unfillable" (default) keeps the rows but is sign-aware — a book
+    cannot buy into 涨停 or sell into 跌停, so at a +1 lock only a
+    non-positive prediction is deployable and at -1 only a non-negative
+    one, and the loss sees that clipped prediction (the same half-line
+    clip the one-sided strategies apply to every sample, composed with
+    it; no-mark rows are dropped). A locked sample on its unfillable side
+    then contributes no gradient — the training analogue of the
+    Evaluator's "unfillable" mask — while on the fillable side (the
+    reversal) it trains normally. "none" trains on every row and ignores
+    the column; "locked" drops every locked and no-mark row.
+
+    Why "unfillable" is the default (three-arm head-to-head, 2026-10-06):
+    on the fillable-masked evaluation it ties "none" (the locked rows'
+    value is split structure that transfers to free names, which the
+    clip preserves) and beats "locked" by a third; but unlike "none" it
+    does not learn to predict the limit continuation a book cannot
+    trade, so the raw prediction files are honest about what is
+    realizable — raw corr close to the masked figure instead of nearly
+    double it — which matters to anything consuming pred/ directly.
     """
 
     # Execution strategies (see class docstring).
     STRATEGIES = ("long_short", "long_only", "short_only")
+    # Lock-mask modes (class docstring); the first is the default.
+    LOCK_MASKS = ("unfillable", "locked", "none")
 
     # Rolling-fit configuration, maintained by the Trainer admin team.
     SRT_MONTH = "201701"  # YYYYMM, inclusive
@@ -59,6 +165,7 @@ class Trainer:
     LOOK_BACK = 24  # training-window length in months
     HALF_LIFE = 12  # sample-weight decay half-life in months
     CKPT_FREQ = 3   # months predicted per fit; window shift size
+    READ_THREADS = 16  # days of a month read concurrently
 
     # Model hyper-parameters, maintained by the Trainer admin team.
     XGB_PARAMS = {
@@ -67,8 +174,8 @@ class Trainer:
         "max_depth": 4,
         "eta": 0.05,
         "subsample": 0.8,
-        # Leave most of the box to others; past ~32 threads the small
-        # per-group datasets see little speedup anyway.
+        # Leave most of the box to others; past ~32 threads the window
+        # fits see little speedup anyway.
         "nthread": 32,
         # Hessian units are median-normalized sample weights (see _fit), so
         # this means: each leaf must hold >= ~1000 median-sized samples.
@@ -81,12 +188,11 @@ class Trainer:
     # _colsample): wide, redundant feature sets need stronger per-tree
     # decorrelation than narrow ones.
     COLSAMPLE_REF_FEATURES = 50
-    # min_child_weight was tuned on full-universe windows of ~2.4M samples
-    # (~4800 stocks x 24 months); _min_child_weight scales it with the
-    # actual window size so a leaf always holds >= ~1/2400th of the data.
-    # Small universes — eif groups run ~300 (group 0) to ~1400 (group 3)
-    # stocks, i.e. ~145k-650k samples per window — would otherwise be
-    # over-regularized into near-constant trees.
+    # min_child_weight was tuned on full-universe daily windows of ~2.4M
+    # samples (~4800 stocks x 24 months); _min_child_weight scales it with
+    # the actual window size so a leaf always holds >= ~1/2400th of the
+    # data. This also absorbs the task-1 grid: 48 instants/day multiply the
+    # sample count, and the floor scales with it.
     MIN_CHILD_REF_SAMPLES = 2_400_000
 
     @classmethod
@@ -105,61 +211,108 @@ class Trainer:
     def __init__(
         self,
         work_dir,  # root directory for outputs (ckpt/, pred/)
-        w_loader,  # callable: date "YYYYMMDD" -> W frame indexed by ukey, columns = [weight]
-        y_loader,  # callable: date "YYYYMMDD" -> Y frame indexed by ukey, columns = [target]
-        x_loader,  # callable: date "YYYYMMDD" -> X frame indexed by ukey, columns = [features]
+        w_loader,  # callable: date "YYYYMMDD" -> [ukey, time, weight]
+        y_loader,  # callable: date "YYYYMMDD" -> [ukey, time, <target>]
+        x_loader,  # callable: date "YYYYMMDD" -> [ukey, time, *features]
         strategy="long_short",  # execution strategy, one of STRATEGIES
+        pred_w_loader=None,  # like w_loader, over the instants to PREDICT (default: w_loader)
+        pred_x_loader=None,  # like x_loader, over the instants to PREDICT (default: x_loader)
+        lock_mask=LOCK_MASKS[0],  # how W's `lock` column enters training, one of LOCK_MASKS
+        group_dummies=None,  # group labels to one-hot from W's `group` column into features (class docstring)
     ):
         assert strategy in self.STRATEGIES, f"strategy must be one of {self.STRATEGIES}, got {strategy!r}"
+        assert lock_mask in self.LOCK_MASKS, f"lock_mask must be one of {self.LOCK_MASKS}, got {lock_mask!r}"
+        self.lock_mask = lock_mask
+        self.group_dummies = list(group_dummies) if group_dummies else None
         self.work_dir = work_dir
         self.w_loader = w_loader
         self.y_loader = y_loader
         self.x_loader = x_loader
+        self.pred_w_loader = pred_w_loader or w_loader
+        self.pred_x_loader = pred_x_loader or x_loader
         self.strategy = strategy
         # Month -> its trading dates in [SRT_MONTH, END_MONTH], from the calendar.
-        dates = DATES[DATES.str[:6].between(self.SRT_MONTH, self.END_MONTH)]
-        self._date_group: dict[str, list[str]] = (
-            dates.groupby(dates.str[:6]).agg(list).to_dict()
-        )
-        # Monthly frames cached across overlapping windows.
-        self._cache = {}
+        span = DATES.filter(DATES.str.slice(0, 6).is_between(self.SRT_MONTH, self.END_MONTH))
+        self._date_group: dict[str, list[str]] = {
+            m[0] if isinstance(m, tuple) else m: g["date"].to_list()
+            for m, g in span.rename("date").to_frame()
+            .group_by(pl.col("date").str.slice(0, 6), maintain_order=True)
+        }
+        # x_loader features (fixed by the first day read) + the group dummies.
+        self._x_features: list[str] | None = None
+        self.features: list[str] | None = None
+
+    def _dummy_exprs(self) -> list[pl.Expr]:
+        """The one-hot group columns from a frame's `group` column."""
+        return [(pl.col("group") == g).cast(pl.Float32).alias(f"group_{g}")
+                for g in self.group_dummies or []]
 
     # ------------------------------------------------------------- data
-    def _load_daily_data(self, date: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """Load one day's (w, y, x) frames as float32, indexed by ukey.
+    def _load_daily_data(self, date: str) -> pl.DataFrame:
+        """One day's joined sample frame: [date, ukey, time, weight, y,
+        *features], float32 values, plus `lock` (float32, 0/+1/-1) under
+        lock_mask "unfillable". The features are the x_loader's columns
+        followed by the group dummies, when configured.
 
-        y and x are reindexed onto W's ukey universe.
-        Only samples with non-NaN weight and target are kept.
+        Y and X are joined onto W's (ukey, time) universe; samples missing
+        the weight or the target are dropped; missing/NaN features are 0.
+        W's optional `lock` column is applied per lock_mask (class
+        docstring): "none" ignores it, "locked" and "unfillable" drop the
+        no-mark (null) rows and "locked" the +1/-1 rows as well.
         """
-        w: pd.DataFrame = self.w_loader(date)
-        y: pd.DataFrame = self.y_loader(date).reindex(index = w.index)
-        x: pd.DataFrame = self.x_loader(date).reindex(index = w.index).fillna(0.0)
-        assert len(w.columns) == 1, f"W must have a unique value column, got {list(w.columns)}"
-        assert len(y.columns) == 1, f"Y must have a unique value column, got {list(y.columns)}"
-        keep = w.iloc[:,0].notna() & y.iloc[:,0].notna()
-        return (
-            w[keep].astype(np.float32),
-            y[keep].astype(np.float32),
-            x[keep].astype(np.float32),
-        )
+        w = self.w_loader(date)
+        y = self.y_loader(date)
+        x = self.x_loader(date)
+        assert w.columns[:3] == [*ID_COLS, "weight"] and set(w.columns[3:]) <= {"lock", "group"}, \
+            f"W columns {w.columns}"
+        assert ("group" in w.columns) == bool(self.group_dummies), \
+            f"W carries a `group` column iff group_dummies is set; W columns {w.columns}"
+        if self.lock_mask == "none":
+            w = w.drop("lock", strict=False)
+        else:
+            assert "lock" in w.columns, f"lock_mask {self.lock_mask!r} needs a `lock` column in W"
+            w = w.filter(pl.col("lock") == 0 if self.lock_mask == "locked"
+                         else pl.col("lock").is_not_null())
+            if self.lock_mask == "locked":
+                w = w.drop("lock")
+        ycol = [c for c in y.columns if c not in ID_COLS]
+        assert len(ycol) == 1, f"Y must have a unique value column, got {y.columns}"
+        feats = [c for c in x.columns if c not in ID_COLS]
+        if self.features is None:
+            self._x_features = feats
+            self.features = feats + [f"group_{g}" for g in self.group_dummies or []]
+        assert feats == self._x_features, f"feature columns changed on {date}"
+        df = (w.join(y.rename({ycol[0]: "y"}), on=list(ID_COLS), how="inner")
+              .filter(pl.col("weight").is_finite() & pl.col("y").is_finite())
+              .join(x, on=list(ID_COLS), how="left"))
+        return df.select(
+            pl.lit(date).alias("date"), *ID_COLS,
+            pl.col("weight").cast(pl.Float32), pl.col("y").cast(pl.Float32),
+            *([pl.col("lock").cast(pl.Float32)] if "lock" in df.columns else []),
+            *[pl.col(c).fill_null(0.0).fill_nan(0.0).cast(pl.Float32)
+              for c in feats],
+            *self._dummy_exprs())
 
-    def _load_monthly_data(self, month: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """Concat the month's daily (w, y, x) frames, indexed by (date, ukey)."""
-        if month in self._cache:
-            return self._cache[month]
-        dates = self._date_group[month]
-        data = [self._load_daily_data(date) for date in dates]
-        w, y, x = (
-            pd.concat(wyx, keys=pd.to_datetime(dates), names=["date"])
-            for wyx in zip(*data)
-        )
-        self._cache[month] = (w, y, x)
-        return w, y, x
+    def _load_window_data(self, months: list[str]) -> pl.DataFrame:
+        """The window's daily frames concatenated, read on READ_THREADS threads (polars releases the GIL
+        while reading). The first day of the study is read alone, since it fixes the feature order.
+        Nothing is cached here: the x_loader keeps the raw daily reads shared across the lockstep trainers,
+        and a second per-trainer copy of the window would double the resident data. rechunk=False keeps
+        the result a view of the day frames instead of copying the window once more."""
+        dates = [d for m in months for d in self._date_group[m]]
+        frames = [self._load_daily_data(dates.pop(0))] if self.features is None else []
+        with ThreadPoolExecutor(self.READ_THREADS) as pool:
+            frames += pool.map(self._load_daily_data, dates)
+        return pl.concat(frames, rechunk=False)
 
     # ------------------------------------------------------------ train
-    def _one_sided_obj(self, pred: np.ndarray, dmat: xgb.DMatrix) -> tuple[np.ndarray, np.ndarray]:
-        """Gradient/hessian of the one-sided loss (y - clip(pred))^2 / 2,
-        clip = ReLU for long_only and -ReLU(-.) for short_only.
+    def _clipped_obj(self, pred: np.ndarray, dmat: xgb.DMatrix,
+                     lock: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Gradient/hessian of the clipped loss (y - clip(pred))^2 / 2,
+        where clip keeps pred on its deployable half-line and is 0
+        elsewhere: ReLU for long_only, -ReLU(-.) for short_only, and per
+        sample under lock_mask "unfillable" (lock = the samples' 0/+1/-1
+        lock), -ReLU(-.) at a +1 lock and ReLU at -1; the clips compose.
 
         On the clipped side the loss is flat, so grad = hess = 0 there; the
         boundary pred = 0 counts as active, which keeps the base_score 0
@@ -170,107 +323,180 @@ class Trainer:
         """
         y = dmat.get_label()
         w = dmat.get_weight()
-        active = pred >= 0.0 if self.strategy == "long_only" else pred <= 0.0
+        active = np.ones_like(pred, dtype=bool)
+        if self.strategy != "long_short":
+            active &= pred >= 0.0 if self.strategy == "long_only" else pred <= 0.0
+        if lock is not None:
+            active &= ((lock == 0.0) | ((lock > 0.0) & (pred <= 0.0))
+                       | ((lock < 0.0) & (pred >= 0.0)))
         return np.where(active, pred - y, 0.0) * w, active * w
 
     def _fit(self, months: list[str]) -> xgb.Booster:
         """Train a booster on the given months with decayed sample weights;
         checkpoint it as {work_dir}/ckpt/{last train month}.json."""
-        data = [self._load_monthly_data(month) for month in months]
-        w, y, x = (pd.concat(wyx) for wyx in zip(*data))
+        df = self._load_window_data(months)
+        n_days = df["date"].n_unique()
+        print(f"{self.work_dir}: {len(df)} rows over {n_days} days, "
+              f"{df.select(pl.struct('date', 'time').n_unique()).item() / n_days:.1f} instants/day",
+              flush=True)
         # Exponential decay: a month HALF_LIFE months before the end of the
         # window carries half the weight of the last month.
         decay = {m: 2.0 ** (i / self.HALF_LIFE) for i, m in enumerate(months)}
-        month = w.index.get_level_values("date").strftime("%Y%m")
-        weight = w.iloc[:, 0] * np.asarray(month.map(decay))
+        weight = (df["weight"].to_numpy()
+                  * df["date"].str.slice(0, 6).replace_strict(decay).to_numpy())
         # Normalize so the hessian unit is "one median-weight sample": raw
-        # weights are liquidity-scaled (~1e6, drifting ~2x over the study),
-        # which would silently retune min_child_weight across windows.
-        weight = weight / weight.median()
+        # weights are liquidity-scaled and drift over the study, which
+        # would silently retune min_child_weight across windows.
+        weight = weight / np.median(weight)
+        x = df.select(self.features).to_numpy()
+        y = df["y"].to_numpy()
+        n_rows = len(df)
+        lock = df["lock"].to_numpy() if self.lock_mask == "unfillable" else None
+        # x is a full copy of the features, so the window frame is dead
+        # weight from here on: free it before QuantileDMatrix allocates.
+        del df
         # QuantileDMatrix pre-bins the features for tree_method "hist":
         # faster to build and ~half the memory of a full DMatrix, with
         # identical training. Inference (_predict) keeps a plain DMatrix.
-        dmat = xgb.QuantileDMatrix(x, label=y.iloc[:, 0], weight=weight)
+        dmat = xgb.QuantileDMatrix(x, label=y, weight=weight,
+                                   feature_names=self.features)
+        # The DMatrix holds the binned copy; free the raw matrix before the
+        # training buffers are allocated.
+        del x
         params = self.XGB_PARAMS | {
-            "colsample_bytree": self._colsample(x.shape[1]),
-            "min_child_weight": self._min_child_weight(len(x)),
+            "colsample_bytree": self._colsample(len(self.features)),
+            "min_child_weight": self._min_child_weight(n_rows),
         }
-        if self.strategy == "long_short":
+        if self.strategy == "long_short" and lock is None:
             booster = xgb.train(params, dmat, self.NUM_BOOST_ROUND)
         else:
-            # One-sided books train against the clipped prediction
-            # (_one_sided_obj). base_score 0 starts on the active boundary —
-            # the 0.5 default would put every short_only sample on the flat
-            # side and stall training at the first round.
+            # One-sided books and the sign-aware lock mask train against
+            # the clipped prediction (_clipped_obj). base_score 0 starts on
+            # the active boundary — the 0.5 default would put every
+            # short_only sample on the flat side and stall training at the
+            # first round.
             params = {k: v for k, v in params.items() if k != "objective"} | {"base_score": 0.0}
-            booster = xgb.train(params, dmat, self.NUM_BOOST_ROUND, obj=self._one_sided_obj)
+            booster = xgb.train(params, dmat, self.NUM_BOOST_ROUND,
+                                obj=lambda p, d: self._clipped_obj(p, d, lock))
         booster.save_model(f"{self.work_dir}/ckpt/{months[-1]}.json")
         return booster
 
     # ---------------------------------------------------------- predict
-    def _predict(self, booster: xgb.Booster, month: str) -> pd.DataFrame:
-        """Predict one month; save one (ukey, pred) file per trading
-        day under {work_dir}/pred/, in the same format as the weight files."""
-        _, _, x = self._load_monthly_data(month)
-        pred = x.index.to_frame(index=False)
-        pred["pred"] = booster.predict(xgb.DMatrix(x)).astype(np.float64)
-        for date, day in pred.groupby("date"):
-            day.assign(ukey=day["ukey"].astype("int32"))[["ukey", "pred"]].to_parquet(
-                f"{self.work_dir}/pred/{date:%Y%m%d}.parquet", index=False
-            )
-        return pred
+    def _predict_day(self, booster: xgb.Booster, date: str,
+                     x: pl.DataFrame | None = None) -> None:
+        """Predict one trading day over pred_w_loader's finite-weight rows
+        (no target needed) and write {work_dir}/pred/{date}.parquet =
+        [ukey, timestamp, pred], keyed like target.{task}. `x` is the day's
+        pred_x_loader frame when the caller already holds it (run_lockstep
+        loads each date once and shares it across the groups)."""
+        w = self.pred_w_loader(date)
+        assert w.columns == [*ID_COLS, "weight", *(["group"] if self.group_dummies else [])], \
+            f"W columns {w.columns}"
+        if x is None:
+            x = self.pred_x_loader(date)
+        df = (w.filter(pl.col("weight").is_finite()).select(pl.exclude("weight"))
+              .with_columns(self._dummy_exprs()).drop("group", strict=False)
+              .join(x, on=list(ID_COLS), how="left"))
+        X = df.select([pl.col(c).fill_null(0.0).fill_nan(0.0).cast(pl.Float32)
+                       if c in df.columns else pl.lit(0.0, dtype=pl.Float32).alias(c)
+                       for c in self.features]).to_numpy()
+        pred = booster.predict(xgb.DMatrix(X, feature_names=self.features)).astype(np.float64)
+        (df.select("ukey", pl.col("time").alias("timestamp"))
+         .with_columns(pl.Series("pred", pred))
+         .write_parquet(f"{self.work_dir}/pred/{date}.parquet"))
 
     # -------------------------------------------------------------- run
-    def _run_window(self, months: list[str], i: int) -> None:
-        """One rolling step: train on months[i : i+LOOK_BACK], checkpoint,
-        predict the next CKPT_FREQ months, then evict the months the window
-        rolls past."""
-        j = i + self.LOOK_BACK
-        k = j + self.CKPT_FREQ
-        train_months = months[i:j]
-        pred_months = months[j:k]
+    @classmethod
+    def _pred_months(cls, months: list[str], i: int) -> list[str]:
+        """The CKPT_FREQ months window i predicts (empty for the last fit)."""
+        j = i + cls.LOOK_BACK
+        return months[j:j + cls.CKPT_FREQ]
+
+    def _fit_window(self, months: list[str], i: int) -> xgb.Booster:
+        """One rolling step's fit: train on months[i : i+LOOK_BACK] and
+        checkpoint; the window's predictions are written by run_lockstep."""
+        train_months = months[i:i + self.LOOK_BACK]
+        pred_months = self._pred_months(months, i)
         pred = f"{pred_months[0]}-{pred_months[-1]}" if pred_months else "none"
         print(f"{self.work_dir}: window {train_months[0]}-{train_months[-1]} -> predict {pred}", flush=True)
-        booster = self._fit(train_months)
-        for month in pred_months:
-            self._predict(booster, month)
-        for month in months[i:i+self.CKPT_FREQ]:
-            self._cache.pop(month, None)
+        return self._fit(train_months)
 
     def run(self):
         """Rolling fit over the calendar months.
 
         Per window: train on LOOK_BACK months, checkpoint the model as
-        {work_dir}/ckpt/{last train month}.json, predict the next CKPT_FREQ
-        months, then shift the window by CKPT_FREQ months and repeat until
-        the months are exhausted.
+        {work_dir}/ckpt/{last train month}.json, predict every trading day
+        of the next CKPT_FREQ months on the prediction instants, then shift
+        the window by CKPT_FREQ months and repeat until the months are
+        exhausted.
         """
-        os.makedirs(f"{self.work_dir}/ckpt", exist_ok=True)
-        os.makedirs(f"{self.work_dir}/pred", exist_ok=True)
-        months = list(self._date_group)
-        for i in range(0, len(months) - self.LOOK_BACK + 1, self.CKPT_FREQ):
-            self._run_window(months, i)
+        self.run_lockstep([self])
+
+    def _load_ckpt(self, path: str) -> xgb.Booster:
+        """A saved checkpoint, fixing the feature list from it when no day
+        has been read yet (a resumed run may never fit)."""
+        booster = xgb.Booster()
+        booster.load_model(path)
+        if self.features is None:
+            self.features = list(booster.feature_names)
+            n_dummies = len(self.group_dummies or [])
+            self._x_features = self.features[:len(self.features) - n_dummies]
+        assert list(booster.feature_names) == self.features, f"{path}: features differ from the run's"
+        return booster
 
     @classmethod
-    def run_lockstep(cls, trainers: list["Trainer"]) -> None:
+    def run_lockstep(cls, trainers: list["Trainer"], resume: bool = False) -> None:
         """Run several trainers over the same calendar in lockstep: every
-        trainer fits window 0, then every trainer fits window 1, and so on.
+        trainer fits window 0, then the window's dates are predicted
+        date-major (each date for every trainer), then window 1, and so on.
 
-        The point is IO sharing: with loaders that cache the raw daily
-        reads (e.g. an lru_cache sized to one window's dates), each file is
-        read once for the first trainer and served from cache to the rest —
-        instead of once per trainer as with sequential run() calls.
+        resume picks a crashed run of the SAME configuration up where it
+        stopped: a window whose checkpoint exists in a trainer's work dir
+        is loaded instead of refit, and only the window's dates missing a
+        pred file in some trainer are predicted (plus each trainer's last
+        written date, which the crash may have truncated). Nothing checks
+        that the configuration matches the files found.
+
+        The point is IO sharing: with training loaders that cache the raw
+        daily reads (e.g. an lru_cache sized to one window's dates), each
+        file is read once for the first trainer and served from cache to
+        the rest. Prediction frames are not cached that way — a full-grid
+        task-1 day is large — so each date's pred_x_loader frame is read
+        once here (READ_THREADS dates at a time, when every trainer shares
+        the same loader) and handed to all trainers before the next chunk.
         """
         for tr in trainers:
             os.makedirs(f"{tr.work_dir}/ckpt", exist_ok=True)
             os.makedirs(f"{tr.work_dir}/pred", exist_ok=True)
         months = list(trainers[0]._date_group)
+        shared_x = all(tr.pred_x_loader is trainers[0].pred_x_loader for tr in trainers)
         for i in range(0, len(months) - cls.LOOK_BACK + 1, cls.CKPT_FREQ):
-            for tr in trainers:
-                tr._run_window(months, i)
+            dates = [d for m in cls._pred_months(months, i) for d in trainers[0]._date_group[m]]
+            if resume:
+                ckpt = months[i + cls.LOOK_BACK - 1]
+                have = [{f[:8] for f in os.listdir(f"{tr.work_dir}/pred") if f.endswith(".parquet")}
+                        for tr in trainers]
+                last = {max(h) for h in have if h}
+                dates = [d for d in dates if d in last or any(d not in h for h in have)]
+                paths = [f"{tr.work_dir}/ckpt/{ckpt}.json" for tr in trainers]
+                if all(os.path.exists(p) for p in paths) and not dates:
+                    print(f"resume: window {months[i]}-{ckpt} done, skipped", flush=True)
+                    continue
+                boosters = [tr._load_ckpt(p) if os.path.exists(p) else tr._fit_window(months, i)
+                            for tr, p in zip(trainers, paths)]
+            else:
+                boosters = [tr._fit_window(months, i) for tr in trainers]
+            with ThreadPoolExecutor(cls.READ_THREADS) as pool:
+                for c in range(0, len(dates), cls.READ_THREADS):
+                    chunk = dates[c:c + cls.READ_THREADS]
+                    xs = (list(pool.map(trainers[0].pred_x_loader, chunk)) if shared_x
+                          else [None] * len(chunk))
+                    for date, x in zip(chunk, xs):
+                        for tr, booster in zip(trainers, boosters):
+                            tr._predict_day(booster, date, x)
 
 
-def filter_correlated(panel: pd.DataFrame, threshold: float = 0.8) -> list[str]:
+def filter_correlated(panel: pl.DataFrame, threshold: float = 0.8) -> list[str]:
     """Greedy factor subset with pairwise |correlation| below `threshold`.
 
     Factors are visited in column order; one is kept iff its absolute
@@ -285,7 +511,7 @@ def filter_correlated(panel: pd.DataFrame, threshold: float = 0.8) -> list[str]:
         return cols
     # one float32 copy, centered in place; correlations from a single
     # F x F gram (normalized after the matmul, not on the N x F panel)
-    X = np.nan_to_num(panel.to_numpy("float32", copy=True), copy=False)
+    X = np.nan_to_num(panel.to_numpy().astype("float32"), copy=False)
     X -= X.mean(axis=0)
     G = X.T @ X
     norm = np.sqrt(np.diag(G).copy())
@@ -304,16 +530,42 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Train one model per weight_target group under an execution strategy."
+        description="Train one rolling model over the eif groups under an "
+                    "execution strategy."
     )
+    parser.add_argument("--task", type=int, required=True, choices=[0, 1],
+                        help="prediction task: 0 盘前 (09:24:59), 1 盘中 "
+                             "(the 48 five-minute points)")
+    parser.add_argument("--times", default=None,
+                        help="subset of the task's prediction times to TRAIN "
+                             "on, e.g. '09:30,10:00' (default: the full grid); "
+                             "predictions are always written on the full grid. "
+                             "Listed, ONE model trains on exactly these instants "
+                             "(09:30 included if listed); without it task 1 trains "
+                             "the 09:30 instant as its own model (`open`) and the "
+                             "other instants as another (`rest`, see --rest-instants), "
+                             "each predicting its own instants")
+    parser.add_argument("--rest-instants", type=int, default=8, metavar="K",
+                        help="task 1 without --times: the `rest` model trains, per "
+                             "day, on K of the 47 non-09:30 instants drawn at random "
+                             "(seeded by the date, so reruns and --resume draw the "
+                             "same); 0 = all 47 (default %(default)s)")
+    parser.add_argument("--x-loader", default="xloader_example",
+                        help="feature loader spec, 'module[:attr]' or "
+                             "'file.py[:attr]' (xloader_contract)")
+    parser.add_argument("--x-cache-dtype", default="float16", choices=["float32", "float16"],
+                        help="storage of the day cache of features: float16 (default) with a "
+                             "per-factor float32 center/scale (xcodec), ~half the resident "
+                             "memory, factors a float16 cannot hold stay float32; or float32 "
+                             "to store them as is")
     parser.add_argument("--group", type=int, nargs="+", default=[0, 1, 2, 3],
                         choices=[0, 1, 2, 3],
-                        help="group column values; one model is trained per group")
+                        help="group column values: one model is trained over all of "
+                             "them, with one-hot dummies of the group label as "
+                             "features (group_{g}, after the x_loader's factors); "
+                             "work dir group{labels}_{strategy}, e.g. group0123_long_short")
     parser.add_argument("--strategy", default="long_short", choices=Trainer.STRATEGIES,
                         help="execution strategy (sets the XGB objective)")
-    parser.add_argument("--feature-dirs", nargs="+", default=None,
-                        help="factor-set directories under FACTORS/ASTOCK "
-                             "(default: all except REVERSAL32)")
     parser.add_argument("--study", default="baseline",
                         help="study name (names the work dirs)")
     parser.add_argument("--work-dir", required=True,
@@ -326,109 +578,173 @@ if __name__ == "__main__":
                         help="text file listing the factors to train on, one "
                              "per line (e.g. another study's factors.txt); "
                              "replaces the correlation filter")
-    parser.add_argument("--y-shift", type=int, default=0,
-                        help="take the target from the eif file this many "
-                             "trading days EARLIER (weight/group stay those "
-                             "of file t): 1 makes day t's y_1 the return "
-                             "close(t)->close(t+1) instead of "
-                             "close(t+1)->close(t+2)")
+    parser.add_argument("--resume", action="store_true",
+                        help="pick a crashed run of the SAME configuration up where it "
+                             "stopped: reuse the checkpoints found in the work dirs and "
+                             "predict only the days still missing a pred file (plus each "
+                             "model's last written day); nothing checks the config matches")
+    parser.add_argument("--end-month", default=None,
+                        help="override the coverage-derived END_MONTH (YYYYMM)")
+    parser.add_argument("--look-back", type=int, default=None,
+                        help=f"override the training-window length in months "
+                             f"(class default {Trainer.LOOK_BACK}), e.g. 2 with "
+                             f"--end-month for a quick smoke run")
+    parser.add_argument("--lock-mask", default=Trainer.LOCK_MASKS[0],
+                        choices=Trainer.LOCK_MASKS,
+                        help="limit-locked rows ({eif_dir}/limit_mask: mark on "
+                             "涨停/跌停, or no mark) in the TRAINING sample: "
+                             "'unfillable' (default) keeps them but clips "
+                             "the loss to the fillable sign (buy into 涨停 / "
+                             "sell into 跌停 earns no gradient: same masked "
+                             "corr as 'none', honest raw predictions), "
+                             "'none' keeps them all, 'locked' drops them "
+                             "(cost a third of the fillable correlation, "
+                             "2026-10-06). Predictions always cover every row")
     args = parser.parse_args()
 
     from functools import lru_cache
 
-    WT_ROOT = "/data/efs/CN-EQ/weight_target"
-    DATA_DIR = f"{WT_ROOT}/eif_v" + str(max(
-        int(d[len("eif_v"):]) for d in os.listdir(WT_ROOT)
-        if d.startswith("eif_v") and d[len("eif_v"):].isdigit()))
-    FACTOR_ROOT = "/data/efs/FACTORS/ASTOCK"
-    FEATURE_DIRS = args.feature_dirs or sorted(
-        d for d in os.listdir(FACTOR_ROOT)
-        if os.path.isdir(f"{FACTOR_ROOT}/{d}") and d != "REVERSAL32")
+    import targets
+    import xcodec
+    import xloader_contract
+
+    EIF_DIR = targets.latest_version_dir(args.task)
+    SECS = targets.eval_times(args.task, args.times)
+    FULL_SECS = targets.TASK_SECONDS[args.task]
+    SLICES = time_slices(args.task, SECS, FULL_SECS, split=args.times is None)
+    # Training instants of a day: --times fixes them; else task 1 draws
+    # --rest-instants of the non-09:30 instants per day, keeping 09:30 for
+    # the `open` model (0 = every instant). The day cache and the training
+    # universe hold only those instants.
+    DRAW_K = args.rest_instants if args.task == 1 and args.times is None else 0
+    assert 0 <= DRAW_K < len(FULL_SECS), f"--rest-instants must be 0..{len(FULL_SECS) - 1}, got {DRAW_K}"
+
     # The study name comes from --study; the weight/target version (latest
     # eif_v{k}) does not appear in work dirs or model/report names.
     STUDY = args.study
-    print(f"study {STUDY}: feature sets {FEATURE_DIRS}", flush=True)
+    XNAME, X_FN = xloader_contract.resolve(args.x_loader)
+    print(f"study {STUDY}: task {args.task}, {len(SECS)} timepoints, "
+          f"x_loader {XNAME}, eif {EIF_DIR}, training rows: "
+          f"lock mask {args.lock_mask}; models per group set: "
+          + ", ".join(f"{name or 'all'} ("
+                      + (f"{DRAW_K} of {len(tr)} drawn per day" if DRAW_K and name == "rest"
+                         else f"{len(tr)} train")
+                      + f" / {len(pr)} pred instants)"
+                      for name, tr, pr in SLICES), flush=True)
 
-    # End month override: the last month whose every trading day has a file
-    # in every feature set AND in the weight/target dir (replaces the
-    # embargo-based default; embargoed eif files are owner-readable here).
-    _have = None
-    for _root in [f"{FACTOR_ROOT}/{n}" for n in FEATURE_DIRS] + [DATA_DIR]:
-        _files = {f[:8] for f in os.listdir(_root)
-                  if len(f) == 16 and f.endswith(".parquet") and f[:8].isdigit()}
-        _have = _files if _have is None else _have & _files
-    _by_month = DATES.groupby(DATES.str[:6]).agg(set)
-    Trainer.END_MONTH = max(m for m, days in _by_month.items() if days <= _have)
-    print(f"end month {Trainer.END_MONTH}: last full-coverage month across "
-          f"feature sets + {DATA_DIR.rstrip('/').rsplit('/', 1)[-1]}", flush=True)
+    # Coverage window: the eif data starts 2021-01-04, so SRT_MONTH is
+    # lifted to the first month whose every trading day has target+weight
+    # files, and END_MONTH is the last (target_dates already intersects the
+    # two; the trailing dates whose horizon crosses the kline end carry
+    # all-NaN y and are dropped per sample, not per month). Feature coverage
+    # is the loader's concern — a missing feature file fails loudly.
+    _have = set(targets.target_dates(args.task, EIF_DIR))
+    _full = [m[0] if isinstance(m, tuple) else m
+             for m, g in DATES.rename("date").to_frame()
+             .group_by(pl.col("date").str.slice(0, 6).alias("month"),
+                       maintain_order=True)
+             .agg(pl.col("date"))
+             .iter_rows()
+             if set(g) <= _have]
+    Trainer.SRT_MONTH = max(Trainer.SRT_MONTH, min(_full))
+    Trainer.END_MONTH = args.end_month or max(_full)
+    if args.look_back:
+        Trainer.LOOK_BACK = args.look_back
+    print(f"months {Trainer.SRT_MONTH} .. {Trainer.END_MONTH}: full "
+          f"target+weight coverage in {EIF_DIR.name}", flush=True)
 
     # Raw daily reads, cached so the lockstep trainers hit each file once
-    # per date instead of once per group (and w/y once instead of twice).
-    # 600 dates covers a full window + pred span (~570 trading days);
-    # the concatenated float32 features run ~25 MB/date, so the cache tops
-    # out around 15 GB.
+    # per date instead of once per group. 600 dates covers a full window +
+    # pred span (~570 trading days).
     @lru_cache(maxsize=600)
-    def read_eif(date: str) -> pd.DataFrame:
-        df = pd.read_parquet(f"{DATA_DIR}/{date}.parquet")
-        # ukey int32 since 2026-09-02; older eif versions stored strings
-        return df.set_axis(pd.to_numeric(df["ukey"]).astype("int32"))
-
-    # Feature sets differ in id column; detect per file. Columns are
-    # prefixed with the set name: sets reuse generic names (feat_1 in both
-    # DAILY and jeffli_minute_features) and XGBoost needs them unique.
-    KEY_COLS = ("ukey", "security_id", "ticker")
+    def day_secs(date: str) -> tuple[int, ...]:
+        """The day's training instants: SECS, or with DRAW_K 09:30 plus
+        DRAW_K of the other instants drawn with the date as seed."""
+        if not DRAW_K:
+            return tuple(SECS)
+        rest = [s for s in FULL_SECS if s != OPEN_SEC]
+        drawn = np.random.default_rng(int(date)).choice(rest, DRAW_K, replace=False)
+        return (OPEN_SEC, *sorted(int(s) for s in drawn))
 
     @lru_cache(maxsize=600)
-    def read_features(date: str) -> pd.DataFrame:
-        parts = []
-        for name in FEATURE_DIRS:
-            df = pd.read_parquet(f"{FACTOR_ROOT}/{name}/{date}.parquet")
-            key = next((c for c in KEY_COLS if c in df.columns), None)
-            assert key is not None, f"{name}/{date}: no id column among {KEY_COLS}"
-            df = df.set_index(pd.to_numeric(df[key]).astype("int32")).rename_axis("ukey")
-            df = df.drop(columns=[c for c in ("timestamp", *KEY_COLS) if c in df.columns])
-            # retroactively rekeyed renames (e.g. 000022->001872) appear
-            # twice under one ukey in DAILY/DAILY_DICTIONARY; keep first
-            df = df[~df.index.duplicated()]
-            parts.append(df.astype(np.float32).add_prefix(f"{name}:"))
-        return pd.concat(parts, axis=1)
+    def times_ns(date: str) -> tuple[int, ...]:
+        return tuple(targets.times_to_utc_ns(date, list(day_secs(date))))
 
-    def make_w_loader(group: int):
-        def w_loader(date: str) -> pd.DataFrame:
-            df = read_eif(date)
-            return df[df.group == group][["weight"]]
+    @lru_cache(maxsize=600)
+    def read_universe(date: str) -> pl.DataFrame:
+        """(ukey, time, weight, group[, lock]) at the TRAINING instants —
+        the daily weight broadcast to each instant (targets.load_weights),
+        with the limit-mask `lock` column joined unless --lock-mask none
+        (the Trainer applies the mode). Locked rows are <1% of the sample
+        but ~40% of the pooled y_1 cross-moment (limit continuation a book
+        cannot fill), yet the head-to-head on kline1m_lb2_lb5 (2026-10-06,
+        same factors and instants, fillable-masked eval) went 6.2% corr
+        keeping them vs 4.4% dropping them: the rows carry signal that
+        transfers to free names, so they stay in; the default
+        "unfillable" keeps that 6.2% while clipping the loss so the
+        predictions do not chase the continuation (Trainer docstring),
+        and the evaluator's --lock-mask handles fillability."""
+        df = targets.load_weights(date, EIF_DIR, args.task)
+        if args.times or DRAW_K:
+            df = df.filter(pl.col("time").cast(pl.Int64).is_in(times_ns(date)))
+        if args.lock_mask != "none":
+            df = targets.join_limit_mask(df, date, EIF_DIR)
+        return df
+
+    def read_universe_full(date: str) -> pl.DataFrame:
+        """(ukey, time, weight, group) at ALL of the task's instants — the
+        prediction universe, whatever --times trained on and locked rows
+        included (the evaluator applies its own mask)."""
+        return targets.load_weights(date, EIF_DIR, args.task)
+
+    @lru_cache(maxsize=600)
+    def read_targets(date: str) -> pl.DataFrame:
+        return targets.load_targets(date, args.task, EIF_DIR, ["y_1"])
+
+    def read_x(date: str) -> pl.DataFrame:
+        return xloader_contract.conform(X_FN(date), date, list(times_ns(date)))
+
+    def read_x_full(date: str) -> pl.DataFrame:
+        """The day's features at ALL of the task's instants (prediction);
+        uncached — run_lockstep reads each date once and shares it."""
+        return xloader_contract.conform(
+            X_FN(date), date, targets.times_to_utc_ns(date, targets.TASK_SECONDS[args.task]))
+
+    @lru_cache(maxsize=2048)
+    def slice_ns(date: str, secs: tuple[int, ...]) -> list[int]:
+        return targets.times_to_utc_ns(date, list(secs))
+
+    def make_w_loader(groups: list[int], secs: list[int], full: bool = False):
+        """W over the given groups' rows at the given instants (a model's
+        training instants — of those the day holds, see day_secs — or its
+        prediction instants of the full grid when full), `group` column
+        included (the Trainer one-hots it)."""
+        read = read_universe_full if full else read_universe
+        secs = tuple(secs)
+
+        def w_loader(date: str) -> pl.DataFrame:
+            return read(date).filter(pl.col("group").is_in(groups)
+                                     & pl.col("time").cast(pl.Int64).is_in(slice_ns(date, secs)))
         return w_loader
 
-    def make_y_loader(group: int):
-        def y_loader(date: str) -> pd.DataFrame:
-            df = read_eif(date)
-            if args.y_shift:
-                # eif file t-k: its y_i spans close(t+1-k) -> close(t+1-k+i);
-                # taken on file t's group universe (the Trainer reindexes
-                # onto W anyway); names absent from file t-k get NaN and
-                # drop out of the day's sample
-                i = POS[date] - args.y_shift
-                if i < 0 or not os.path.exists(f"{DATA_DIR}/{DATES.iloc[i]}.parquet"):
-                    return pd.DataFrame({"y_1": np.nan}, index=df.index[df.group == group])
-                src = read_eif(DATES.iloc[i])
-                return src[["y_1"]].reindex(df.index[df.group == group])
-            return df[df.group == group][["y_1"]]
-        return y_loader
+    def y_loader(date: str) -> pl.DataFrame:
+        return read_targets(date)
 
     # Factor pre-filter: greedy pairwise-correlation dedup on a quarterly
     # sample of the training range (see filter_correlated). Computed once,
     # applied to every date's frame.
-    span = DATES[DATES.str[:6].between(Trainer.SRT_MONTH, Trainer.END_MONTH)]
+    span = DATES.filter(DATES.str.slice(0, 6)
+                        .is_between(Trainer.SRT_MONTH, Trainer.END_MONTH))
     if args.factors:
         keep = [l.strip() for l in open(args.factors) if l.strip()]
         print(f"factors: {len(keep)} listed in {args.factors} "
               f"(correlation filter skipped)", flush=True)
     elif args.corr_threshold < 1.0:
-        sample = list(span)[::63]
-        panel = pd.concat([read_features(d) for d in sample])
+        sample = span.to_list()[::63]
+        panel = pl.concat([read_x(d) for d in sample]).drop("ukey", "time")
         keep = filter_correlated(panel, args.corr_threshold)
         print(f"factor filter (|corr| < {args.corr_threshold}, "
-              f"{len(sample)} sample days): kept {len(keep)}/{panel.shape[1]}",
+              f"{len(sample)} sample days): kept {len(keep)}/{panel.width}",
               flush=True)
         del panel
     else:
@@ -437,28 +753,59 @@ if __name__ == "__main__":
     # reuse it verbatim via --factors.
     os.makedirs(f"{args.work_dir}/{STUDY}", exist_ok=True)
     with open(f"{args.work_dir}/{STUDY}/factors.txt", "w") as fh:
-        fh.write("\n".join(keep if keep is not None
-                           else list(read_features(span.iloc[0]).columns)) + "\n")
-    if args.y_shift:
-        print(f"y shift {args.y_shift}: day t's target is y_1 of eif file "
-              f"t-{args.y_shift}", flush=True)
+        cols = keep if keep is not None else [
+            c for c in read_x(span[0]).columns if c not in ID_COLS]
+        fh.write("\n".join(cols) + "\n")
 
-    def x_loader(date: str) -> pd.DataFrame:
-        # reindex, not [keep]: the factor set drifts across dates, and a
-        # kept column absent on some day must yield NaN (-> 0 downstream)
-        df = read_features(date)
-        return df.reindex(columns=keep) if keep is not None else df
+    def _reindex(df: pl.DataFrame) -> pl.DataFrame:
+        # column-reindex, not select: the factor set can drift across dates,
+        # and a kept column absent on some day must yield null (-> 0
+        # downstream)
+        if keep is None:
+            return df
+        return df.select("ukey", "time",
+                         *[pl.col(c) if c in df.columns
+                           else pl.lit(None, dtype=pl.Float64).alias(c)
+                           for c in keep])
 
+    # The day cache holds only the factors the model trains on (after the
+    # filter / --factors list), as float16 by default (see xcodec), or as
+    # float32, the precision the samples are built at, with
+    # --x-cache-dtype float32.
+    codec = None
+    if args.x_cache_dtype == "float16":
+        codec = xcodec.Float16Codec.fit([_reindex(read_x(d)) for d in span.to_list()[::63]])
+        print(codec.summary(), flush=True)
+
+    @lru_cache(maxsize=600)
+    def cached_x(date: str):
+        df = _reindex(read_x(date))
+        if codec is None:
+            return df.with_columns(pl.exclude(*ID_COLS).cast(pl.Float32))
+        return codec.encode(df)
+
+    def x_loader(date: str) -> pl.DataFrame:
+        return cached_x(date) if codec is None else codec.decode(*cached_x(date))
+
+    def x_loader_full(date: str) -> pl.DataFrame:
+        return _reindex(read_x_full(date))
+
+    # One trainer over all the groups per time slice (one, or task 1's
+    # `open` + `rest`).
     trainers = [
         Trainer(
-            work_dir=f"{args.work_dir}/{STUDY}/group{group}_{args.strategy}",
-            w_loader=make_w_loader(group),
+            work_dir=f"{args.work_dir}/{STUDY}/{group_dir(args.group)}{'_' + sl if sl else ''}_{args.strategy}",
+            w_loader=make_w_loader(args.group, train_secs),
             x_loader=x_loader,
-            y_loader=make_y_loader(group),
+            y_loader=y_loader,
             strategy=args.strategy,
+            pred_w_loader=make_w_loader(args.group, pred_secs, full=True),
+            pred_x_loader=x_loader_full,
+            lock_mask=args.lock_mask,
+            group_dummies=args.group,
         )
-        for group in args.group
+        for sl, train_secs, pred_secs in SLICES
     ]
-    # Windows outer, groups inner: each date's files are read once and
-    # shared across the groups through the caches above.
-    Trainer.run_lockstep(trainers)
+    # Windows outer, models inner: each date's files are read once and
+    # shared across the models through the caches above.
+    Trainer.run_lockstep(trainers, resume=args.resume)

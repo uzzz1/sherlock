@@ -2,9 +2,15 @@
 
 Per response (y_1/y_3/y_5), a page of seven metric tables and a
 cumulative-spnl-curve page; then one spnl-vs-horizon plot across all
-responses. The 15 rows/lines are the native side x group buckets, keyed
-by (side = all/pos/neg, group = all/0/1/2/3). See evaluator.md "Report
-guidance" for units and encoding.
+responses; then, when the eval carries `turnover`, a turnover page: per
+decision slot the median and IQR over days of the daily turnover of the
+linear and decile books built on the fitter (fraction of gross replaced
+by the once-a-day rebalance at that slot; evaluator.py docstring). The
+15 rows/lines of the metric pages are the native side x group buckets,
+keyed by (side = all/pos/neg, group = all/0/1/2/3). Units: spnl and
+curve values in basis points. See
+.claude/skills/evaluate-factors/SKILL.md (section 3) for the layout
+convention and sanity checks.
 
 Usage:
     python write_report.py --eval {work_dir}/eval.nc \
@@ -12,13 +18,14 @@ Usage:
         [--fitter pred] [--title "..."]
 
 e.g. eval.nc from ~/sherlock_work/astock_daily/long_short/ (the stitched
-per-group models; study named after the feature dir, never the
+models; study named after the feature dir, never the
 weight/target version).
 """
 
 import argparse
 from itertools import product
 
+import numpy as np
 import pandas as pd
 import xarray as xr
 import matplotlib
@@ -110,6 +117,8 @@ def lineplot(title, ylabel, xlabel, series, x=None):
 figs = []
 d0, d1 = pd.Timestamp(ds.date.values[0]), pd.Timestamp(ds.date.values[-1])
 title = args.title or f"{args.eval} — fitter '{args.fitter}'"
+if ds.attrs.get("lock_mask"):
+    title += f" — lock mask: {ds.attrs['lock_mask']}"
 for r in RESPONSES:
     fig, axes = plt.subplots(1, 7, figsize=(16.53, 8.27))
     fig.suptitle(f"{title} — response {r}, {d0:%Y-%m-%d} to {d1:%Y-%m-%d}",
@@ -139,10 +148,40 @@ figs.append(lineplot(
     f"spnl by horizon and bucket ({RESPONSES[0]}..{RESPONSES[-1]})",
     "spnl (bps)", "horizon (days)", spnl_h, x=horizons))
 
+turn = {}
+if "turnover" in ds:
+    # One portfolio per slot, rebalanced daily: median and IQR over days.
+    fig, ax = plt.subplots(figsize=(11.69, 8.27))
+    tods = list(ds.tod.values)
+    y = np.arange(len(tods))
+    for k, (book, color) in enumerate((("linear", "#2b6cb0"), ("decile", "#c05621"))):
+        v = ds.turnover.sel(book=book)
+        med = v.median("date").to_numpy()
+        lo, hi = (v.quantile(q, "date").to_numpy() for q in (0.25, 0.75))
+        turn[book] = float(np.nanmedian(v.to_numpy()))
+        ax.barh(y + (k - 0.5) * 0.3, med, xerr=[med - lo, hi - med], color=color,
+                height=0.28, error_kw={"ecolor": MUTED, "lw": 0.8},
+                label=f"{book} book — all-slot median {turn[book]:.2f}")
+    ax.set_yticks(y, tods, fontsize=6 if len(tods) > 12 else 8)
+    ax.invert_yaxis()
+    polish(ax)
+    ax.set_xlim(0, 1)
+    ax.legend(frameon=False, fontsize=8, loc="lower right")
+    ax.set_xlabel("daily turnover, fraction of gross replaced (median, IQR over days)",
+                  color=MUTED, fontsize=9)
+    ax.set_title("Portfolio turnover by decision slot (one portfolio per slot, "
+                 "rebalanced once a day at that slot; fillable positions only)",
+                 color=INK, fontsize=12, loc="left", pad=12)
+    fig.tight_layout()
+    figs.append(fig)
+
 with PdfPages(args.pdf) as pdf:
     for fig in figs:
         pdf.savefig(fig)
 print(f"wrote {args.pdf}")
+if turn:
+    print("daily turnover, all-slot median: "
+          + "  ".join(f"{b} {v:.3f}" for b, v in turn.items()))
 for r in RESPONSES:
     print(f"--- response {r}")
     print(tables[r].round(3).to_string())

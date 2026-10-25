@@ -1,2 +1,8 @@
 *.pyc
 __pycache__/
+OPEN_QUESTIONS.md
+RESOLVED_QUESTIONS.md
+predict.py
+xloader_kline1m_lb.py
+*.pdf
+*.log

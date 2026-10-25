@@ -28,6 +28,11 @@ Usage
     python factor_importance.py --study NAME --work-dir ROOT
         [--group 0 1 2 3] [--strategy long_short] [--top 10] [--stack 8]
         [--pdf report_importance_{study}_{strategy}.pdf]
+
+A study has one booster over its groups per time slice (dirs
+group{labels}[_open|_rest]_{strategy}): one report page per model,
+labelled by the concatenated group labels and the slice (e.g. 0123_open),
+whose factors include the group_{g} dummies.
 """
 
 import argparse
@@ -42,7 +47,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
-from trainer import Trainer
+from trainer import Trainer, model_dirs
 
 # Categorical palette (validated reference order) + neutral for "Other";
 # recessive text/grid inks.
@@ -126,8 +131,11 @@ def style(ax, title):
         ax.spines[side].set_color(GRID)
 
 
-shares = {g: gain_shares(f"{WORK_ROOT}/group{g}_{args.strategy}/ckpt")
-          for g in args.group}
+# Model labels: the concatenated group labels (e.g. "0123") plus task 1's
+# instant slice (e.g. "0123_open").
+GROUPS = [d.removeprefix("group").removesuffix(f"_{args.strategy}")
+          for d in model_dirs(WORK_ROOT, args.group, args.strategy)]
+shares = {g: gain_shares(f"{WORK_ROOT}/group{g}_{args.strategy}/ckpt") for g in GROUPS}
 
 # aligned (month, group, factor) panel -> importance.nc beside eval.nc
 months = sorted(set().union(*(s.index for s in shares.values())))
@@ -135,8 +143,8 @@ factors = list(next(iter(shares.values())).columns)
 panel = xr.Dataset(
     {"share": (("month", "group", "factor"),
                np.stack([shares[g].reindex(months).to_numpy()
-                         for g in args.group], axis=1))},
-    coords={"month": months, "group": args.group, "factor": factors},
+                         for g in GROUPS], axis=1))},
+    coords={"month": months, "group": GROUPS, "factor": factors},
     attrs={"importance": "total_gain share", "study": STUDY,
            "strategy": args.strategy, "top_k": args.top},
 )
@@ -145,7 +153,7 @@ panel.to_netcdf(f"{WORK_ROOT}/{args.strategy}/importance.nc")
 
 summary = []
 with PdfPages(PDF) as pdf:
-    for g in args.group:
+    for g in GROUPS:
         p = shares[g]
         t = pd.to_datetime(p.index, format="%Y%m")
         pooled = p.mean(axis=0)
